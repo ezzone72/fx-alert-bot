@@ -23,6 +23,8 @@ ASSET_DIR = "assets"
 ARROW_DIR = os.path.join(ASSET_DIR, "arrows")
 TREND_IMAGE_PATH = os.path.join(ASSET_DIR, "trend.png")
 
+URGENT_PCT = 0.5  # 직전 값 대비 0.5% 이상 변동 시 긴급 알림
+
 
 def _get_threshold() -> float:
     v = os.getenv("THRESHOLD", "1.1").strip()
@@ -76,10 +78,6 @@ def _sparkline(series: List[float], width: int = 48) -> str:
 
 
 def _trend_window(data: List[float], window_n: int, half_days: float) -> Optional[Dict[str, float]]:
-    """
-    window_n: 15D=720, 30D=1440
-    half_days: 15D는 7.5, 30D는 15.0 (전반/후반 비교 구간 길이)
-    """
     if len(data) < window_n:
         return None
 
@@ -226,7 +224,7 @@ def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: 
     return "NONE", None
 
 
-# ========= 화살표 이미지 =========
+# ========= 화살표 이미지 (10도 단위, 상하 18장) =========
 
 def _ensure_dirs():
     os.makedirs(ARROW_DIR, exist_ok=True)
@@ -234,19 +232,10 @@ def _ensure_dirs():
 
 
 def _bucket_angle_deg_10(angle_deg: float) -> Tuple[int, int]:
-    """
-    10°~90°를 10도 단위로 버킷팅.
-    - |angle| < 5° 는 '보합(→)' 처리 (버킷 이미지 사용 안 함)
-    반환: (sign, bucket)
-      - sign: +1 / -1 / 0
-      - bucket: 10,20,...,90 (sign==0이면 bucket=0)
-    """
     if abs(angle_deg) < 5.0:
         return 0, 0
-
     sign = 1 if angle_deg > 0 else -1
     a = abs(angle_deg)
-
     bucket = int(round(a / 10.0) * 10)
     if bucket < 10:
         bucket = 10
@@ -256,12 +245,6 @@ def _bucket_angle_deg_10(angle_deg: float) -> Tuple[int, int]:
 
 
 def _draw_arrow_png(path: str, angle_deg: float, size: int = 160) -> None:
-    """
-    투명 PNG에 오른쪽(→) 화살표를 그리고 angle_deg 만큼 회전하여 저장.
-    ✅ 규칙:
-      +각도 = 위쪽(↗)  (PIL rotate는 +가 CCW)
-      -각도 = 아래쪽(↘)
-    """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
@@ -269,7 +252,6 @@ def _draw_arrow_png(path: str, angle_deg: float, size: int = 160) -> None:
     length = int(size * 0.35)
     thickness = max(3, size // 28)
 
-    # 기본: 오른쪽 화살표(0°)
     x1, y1 = cx - length, cy
     x2, y2 = cx + length, cy
 
@@ -279,38 +261,26 @@ def _draw_arrow_png(path: str, angle_deg: float, size: int = 160) -> None:
     d.line((x2, y2, x2 - head, y2 - head // 2), fill=(255, 255, 255, 255), width=thickness)
     d.line((x2, y2, x2 - head, y2 + head // 2), fill=(255, 255, 255, 255), width=thickness)
 
-    # ✅ 여기 핵심: -가 아니라 +로 회전해야 +각도가 위로 갑니다
+    # +각도=위, -각도=아래
     img = img.rotate(angle_deg, resample=Image.Resampling.BICUBIC, center=(cx, cy), expand=False)
     img.save(path, "PNG")
 
 
 def _get_arrow_image_path_10(angle_deg: float) -> Optional[str]:
-    """
-    10°~90° 버킷의 up/down 이미지(총 18장)를 사용.
-    - 보합(|angle|<5°)은 None 반환 → 별도 '→' 처리
-    """
     _ensure_dirs()
     sign, bucket = _bucket_angle_deg_10(angle_deg)
     if sign == 0:
         return None
-
     tag = "up" if sign > 0 else "down"
     fname = f"{tag}_{bucket:02d}.png"
     path = os.path.join(ARROW_DIR, fname)
-
     if not os.path.exists(path):
-        # up은 +bucket, down은 -bucket로 생성
         ang = float(bucket) if sign > 0 else -float(bucket)
         _draw_arrow_png(path, ang)
-
     return path
 
 
 def _build_trend_panel(angle15: float, angle30: float) -> str:
-    """
-    15D/30D 방향 이미지를 하나의 패널(trend.png)로 합쳐 저장.
-    - 보합은 '→' 텍스트로 표시 (이미지 없이)
-    """
     _ensure_dirs()
 
     p15 = _get_arrow_image_path_10(angle15)
@@ -331,18 +301,15 @@ def _build_trend_panel(angle15: float, angle30: float) -> str:
 
     d.text((16, 12), "Trend Direction (10° buckets)", fill=(255, 255, 255, 255), font=font)
 
-    # 라벨
     d.text((55, 65), "15D", fill=(255, 255, 255, 255), font=font)
     d.text((265, 65), "30D", fill=(255, 255, 255, 255), font=font)
 
-    # 15D
     if p15:
         img15 = Image.open(p15).convert("RGBA")
         panel.alpha_composite(img15, (30, 90))
     else:
         d.text((70, 120), "→", fill=(255, 255, 255, 255), font=font_mid)
 
-    # 30D
     if p30:
         img30 = Image.open(p30).convert("RGBA")
         panel.alpha_composite(img30, (240, 90))
@@ -360,108 +327,127 @@ def main():
 
     data = load_data()
 
+    # 부족하면 30일 채우기(최초 1회)
     if len(data) < MAX_30D:
         try:
             data = bootstrap_fill_30d_if_needed(data)
             save_data(data)
         except Exception as e:
+            # 부트스트랩 실패는 긴급은 아니므로 텍스트만 1회 안내
             send_message(f"⚠️ 부트스트랩 실패(과거데이터 채우기)\n{e}")
 
+    # 최신 값 조회
     try:
         rates, used_date = fetch_jpy100_item_with_date_fallback()
     except Exception as e:
         send_message(f"⚠️ 환율 수신 실패\n{e}")
         return
 
-    # 기준환율: deal_bas_r
     price = rates["deal"]
     if price is None:
         send_message("⚠️ deal_bas_r(매매기준율) 값이 없습니다.")
         return
 
+    # ===== 긴급 변동 체크(직전 값 대비) =====
+    prev_price = data[-1] if data else None
+    urgent_trigger = False
+    urgent_msg = None
+    if prev_price is not None and prev_price != 0:
+        pct = (price - prev_price) / prev_price * 100.0
+        if abs(pct) >= URGENT_PCT:
+            urgent_trigger = True
+            direction = "상승" if pct > 0 else "하락"
+            urgent_msg = (
+                "🚨 긴급 변동 감지\n"
+                "----------------------\n"
+                f"JPY(100)/KRW (기준: 매매기준율)\n"
+                f"기준일: {used_date}\n"
+                f"직전: {prev_price:.4f}\n"
+                f"현재: {price:.4f}\n"
+                f"변동: {pct:+.3f}% ({direction})"
+            )
+
+    # ===== 데이터 반영(30분마다 1개) =====
     data = append_and_trim(data, price)
     save_data(data)
 
+    # 평균(표시/판정)
     a15_show = avg_last_partial(data, MAX_15D)
     a30_show = avg_last_partial(data, MAX_30D)
-
     a15 = avg_last(data, MAX_15D)
     a30 = avg_last(data, MAX_30D)
 
-    is_test = len(data) < MAX_15D
-
-    # 15D 추세(전반7.5D vs 후반7.5D)
+    # 추세
     t15 = _trend_window(data, MAX_15D, half_days=7.5)
-    # 30D 추세(전반15D vs 후반15D)
     t30 = _trend_window(data, MAX_30D, half_days=15.0)
 
-    last_48 = data[-48:] if len(data) >= 48 else data[:]
-    chart = _sparkline(last_48, width=min(48, len(last_48))) if last_48 else ""
-
-    lines = []
-    if is_test:
-        lines.append("🧪 TEST(수집중) — 15일 데이터 미만")
-    lines.append("📊 엔화 환율 알림 (전신환/기준환율 기준)")
-    lines.append("----------------------")
-    lines.append("JPY(100) / KRW")
-    lines.append(f"기준일: {used_date}")
-    lines.append(f"매매기준율(deal): {price:.4f}")
-
-    # 중간값 한 줄
-    if rates.get("mid") is not None:
-        lines.append(f"중간값(mid=(TTB+TTS)/2): {rates['mid']:.4f}")
-    else:
-        lines.append("중간값(mid=(TTB+TTS)/2): N/A")
-
-    lines.append(f"15D 평균(현재까지): {a15_show:.4f}" if a15_show is not None else "15D 평균(현재까지): N/A")
-    lines.append(f"30D 평균(현재까지): {a30_show:.4f}" if a30_show is not None else "30D 평균(현재까지): N/A")
-    lines.append(f"데이터: {len(data)}/{MAX_30D} (30분봉)")
-
-    # 추세 15D
-    if t15 is None:
-        lines.append("추세(15D): 데이터 부족(15일 필요)")
-        angle15 = 0.0
-    else:
-        direction15 = "하락추세" if t15["a_last"] < t15["a_first"] else "상승/횡보"
-        lines.append(
-            f"추세(15D): {direction15} | 전반7.5D {t15['a_first']:.4f} → 후반7.5D {t15['a_last']:.4f}"
-        )
-        lines.append(
-            f"기울기(15D): {t15['slope_per_day']:+.4f} 원/일 ({t15['pct_per_day']:+.3f}%/일) | 각도: {t15['angle_deg']:+.2f}°"
-        )
-        angle15 = t15["angle_deg"]
-
-    # 추세 30D
-    if t30 is None:
-        lines.append("추세(30D): 데이터 부족(30일 필요)")
-        angle30 = 0.0
-    else:
-        direction30 = "하락추세" if t30["a_last"] < t30["a_first"] else "상승/횡보"
-        lines.append(
-            f"추세(30D): {direction30} | 전반15D {t30['a_first']:.4f} → 후반15D {t30['a_last']:.4f}"
-        )
-        lines.append(
-            f"기울기(30D): {t30['slope_per_day']:+.4f} 원/일 ({t30['pct_per_day']:+.3f}%/일) | 각도: {t30['angle_deg']:+.2f}°"
-        )
-        angle30 = t30["angle_deg"]
-
-    if chart:
-        lines.append(f"최근 24h: {chart}")
-
+    # 신호
     state, sig = decide_signal(price, a15, a30, th)
-    if sig:
+
+    # ===== 1번 적용: 리포트는 “신호 있을 때만” 발송 =====
+    report_trigger = sig is not None
+
+    # 1) 긴급이면 즉시 발송(신호 없어도)
+    if urgent_trigger and urgent_msg:
+        send_message(urgent_msg)
+
+    # 2) 신호가 있으면 리포트 + 이미지 발송
+    if report_trigger:
+        lines = []
+        lines.append("📊 엔화 환율 신호 리포트 (전신환/기준환율 기준)")
+        lines.append("----------------------")
+        lines.append("JPY(100) / KRW")
+        lines.append(f"기준일: {used_date}")
+        lines.append(f"매매기준율(deal): {price:.4f}")
+        if rates.get("mid") is not None:
+            lines.append(f"중간값(mid=(TTB+TTS)/2): {rates['mid']:.4f}")
+        else:
+            lines.append("중간값(mid=(TTB+TTS)/2): N/A")
+
+        lines.append(f"15D 평균(현재까지): {a15_show:.4f}" if a15_show is not None else "15D 평균(현재까지): N/A")
+        lines.append(f"30D 평균(현재까지): {a30_show:.4f}" if a30_show is not None else "30D 평균(현재까지): N/A")
+        lines.append(f"데이터: {len(data)}/{MAX_30D} (30분봉)")
+
+        # 15D
+        if t15 is None:
+            lines.append("추세(15D): 데이터 부족(15일 필요)")
+            angle15 = 0.0
+        else:
+            direction15 = "하락추세" if t15["a_last"] < t15["a_first"] else "상승/횡보"
+            lines.append(f"추세(15D): {direction15} | 전반7.5D {t15['a_first']:.4f} → 후반7.5D {t15['a_last']:.4f}")
+            lines.append(f"기울기(15D): {t15['slope_per_day']:+.4f} 원/일 ({t15['pct_per_day']:+.3f}%/일) | 각도: {t15['angle_deg']:+.2f}°")
+            angle15 = t15["angle_deg"]
+
+        # 30D
+        if t30 is None:
+            lines.append("추세(30D): 데이터 부족(30일 필요)")
+            angle30 = 0.0
+        else:
+            direction30 = "하락추세" if t30["a_last"] < t30["a_first"] else "상승/횡보"
+            lines.append(f"추세(30D): {direction30} | 전반15D {t30['a_first']:.4f} → 후반15D {t30['a_last']:.4f}")
+            lines.append(f"기울기(30D): {t30['slope_per_day']:+.4f} 원/일 ({t30['pct_per_day']:+.3f}%/일) | 각도: {t30['angle_deg']:+.2f}°")
+            angle30 = t30["angle_deg"]
+
+        # 최근 24h 스파크라인(신호 리포트에서만)
+        last_48 = data[-48:] if len(data) >= 48 else data[:]
+        chart = _sparkline(last_48, width=min(48, len(last_48))) if last_48 else ""
+        if chart:
+            lines.append(f"최근 24h: {chart}")
+
+        # 신호 문구
         lines.append(sig)
+
+        # 상태 중복 방지(신호 바뀔 때만 갱신)
         prev = load_state()
         if state != prev:
             save_state(state)
 
-    # ✅ 방향성 이미지를 생성해서 첨부(15D/30D 둘 다)
-    try:
-        img_path = _build_trend_panel(angle15, angle30)
-        send_message("\n".join(lines), file_path=img_path, filename="trend.png")
-    except Exception as e:
-        # 이미지 실패해도 텍스트는 보내기
-        send_message("\n".join(lines) + f"\n(이미지 생성 실패: {e})")
+        # 방향 이미지 첨부
+        try:
+            img_path = _build_trend_panel(angle15, angle30)
+            send_message("\n".join(lines), file_path=img_path, filename="trend.png")
+        except Exception as e:
+            send_message("\n".join(lines) + f"\n(이미지 생성 실패: {e})")
 
 
 if __name__ == "__main__":
