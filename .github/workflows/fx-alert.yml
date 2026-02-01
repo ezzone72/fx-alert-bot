@@ -37,10 +37,11 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python - << 'PY'
-          import os, requests
+          import os, requests, datetime
           url = os.getenv("DISCORD_WEBHOOK_URL","").strip()
           assert url, "DISCORD_WEBHOOK_URL secret missing"
-          r = requests.post(url, json={"content":"✅ fx-alert-bot: workflow test ping"}, timeout=15)
+          msg = "✅ fx-alert-bot ping " + datetime.datetime.utcnow().isoformat() + "Z"
+          r = requests.post(url, json={"content": msg}, timeout=15)
           print("status:", r.status_code)
           r.raise_for_status()
           PY
@@ -53,13 +54,24 @@ jobs:
         run: |
           python main.py
 
+      - name: Debug files
+        run: |
+          echo "PWD=$(pwd)"
+          echo "==== ls -la (repo root) ===="
+          ls -la
+          echo "==== find data/state ===="
+          find . -maxdepth 2 -type f \( -name "data.csv" -o -name "state.json" \) -print
+
       - name: Commit rolling files if changed
         run: |
           git config user.name "fx-alert-bot"
           git config user.email "fx-alert-bot@users.noreply.github.com"
 
-          git add data.csv state.json || true
+          # 파일이 존재할 때만 add (없으면 조용히 넘어감)
+          [ -f data.csv ] && git add data.csv || true
+          [ -f state.json ] && git add state.json || true
 
+          # 변경 없으면 종료
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
