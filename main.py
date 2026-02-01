@@ -85,6 +85,17 @@ def main() -> None:
     data = load_data()
     data = append_and_trim(data, price)
     save_data(data)
+    # 데이터가 아직 부족하면 1회만 '정상 실행' 알림을 보냄
+    if len(data) < MAX_15D:
+        prev = load_state()
+        if prev != "BOOT":
+            send_telegram(
+                f"✅ 봇 정상 실행(수집중)\n"
+                f"현재 데이터: {len(data)}/{MAX_15D} (15D 평균 준비 전)\n"
+                f"가격(JPY100/KRW): {price}"
+            )
+            save_state("BOOT")
+        return
 
     a15 = avg_last(data, MAX_15D)
     a30 = avg_last(data, MAX_30D)
