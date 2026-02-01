@@ -37,7 +37,8 @@ def fetch_jpy100_krw() -> Optional[float]:
     if not authkey:
         raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
 
-    url = "https://www.koreaexim.go.kr/site/program/financial/exchangeJSON"
+    url = "https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON"
+
     params = {"authkey": authkey, "searchdate": "", "data": "AP01"}
 
     r = requests.get(url, params=params, timeout=20)
