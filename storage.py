@@ -1,39 +1,51 @@
-import csv
 import os
 from typing import List, Optional
 
-MAX_30D = 48 * 30
-MAX_15D = 48 * 15
+DEFAULT_FILE = "data.csv"
 
-CSV_FILE = "data.csv"
+# 30분봉 기준
+MAX_15D = 2 * 24 * 15   # 720
+MAX_30D = 2 * 24 * 30   # 1440
 
 
-def load_data() -> List[float]:
-    if not os.path.exists(CSV_FILE):
+def load_data(filename: str = DEFAULT_FILE) -> List[float]:
+    if not os.path.exists(filename):
         return []
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        return [float(row[0]) for row in csv.reader(f) if row]
+    out: List[float] = []
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                out.append(float(s))
+            except Exception:
+                continue
+    return out
 
 
-def append_and_trim(data: List[float], value: float) -> List[float]:
-    data.append(value)
-    return data[-MAX_30D:]
-
-
-def save_data(data: List[float]) -> None:
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+def save_data(data: List[float], filename: str = DEFAULT_FILE) -> None:
+    with open(filename, "w", encoding="utf-8") as f:
         for v in data:
-            w.writerow([v])
+            f.write(f"{v}\n")
+
+
+def append_and_trim(data: List[float], value: float, max_len: int = MAX_30D) -> List[float]:
+    data.append(float(value))
+    if len(data) > max_len:
+        data = data[-max_len:]
+    return data
 
 
 def avg_last(data: List[float], n: int) -> Optional[float]:
     if len(data) < n:
         return None
-    return sum(data[-n:]) / n
+    w = data[-n:]
+    return sum(w) / n
 
 
 def avg_last_partial(data: List[float], n: int) -> Optional[float]:
     if not data:
         return None
-    return sum(data[-min(len(data), n):]) / min(len(data), n)
+    w = data[-n:] if len(data) >= n else data[:]
+    return sum(w) / len(w)
