@@ -230,38 +230,37 @@ def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: 
 
 def _ensure_dirs():
     os.makedirs(ARROW_DIR, exist_ok=True)
+    os.makedirs(ASSET_DIR, exist_ok=True)
 
 
-def _bucket_angle_deg(angle_deg: float) -> Tuple[int, int]:
+def _bucket_angle_deg_10(angle_deg: float) -> Tuple[int, int]:
     """
-    5°~70°만 사용(총 14개). 각도는 숫자 출력은 그대로 유지하되,
-    이미지는 이 버킷으로 매핑.
-    반환: (sign, bucket) where sign=+1 or -1 or 0, bucket in {5,10,...,70}
+    10°~90°를 10도 단위로 버킷팅.
+    - |angle| < 5° 는 '보합(→)' 처리 (버킷 이미지 사용 안 함)
+    반환: (sign, bucket)
+      - sign: +1 / -1 / 0
+      - bucket: 10,20,...,90 (sign==0이면 bucket=0)
     """
-    if angle_deg > 0:
-        sign = 1
-    elif angle_deg < 0:
-        sign = -1
-    else:
-        sign = 0
+    if abs(angle_deg) < 5.0:
+        return 0, 0
 
+    sign = 1 if angle_deg > 0 else -1
     a = abs(angle_deg)
-    if a < 2.5:
-        # 너무 작은 건 5도로 올리지 않고 "거의 횡보"로 취급
-        return sign, 5  # 요청상 14개만 쓰기 위해 5도로 붙입니다(거의 flat도 약한 화살표)
-    # 가장 가까운 5도
-    bucket = int(round(a / 5.0) * 5)
-    if bucket < 5:
-        bucket = 5
-    if bucket > 70:
-        bucket = 70
+
+    bucket = int(round(a / 10.0) * 10)
+    if bucket < 10:
+        bucket = 10
+    if bucket > 90:
+        bucket = 90
     return sign, bucket
 
 
 def _draw_arrow_png(path: str, angle_deg: float, size: int = 160) -> None:
     """
-    투명 배경 PNG에 오른쪽 방향 화살표를 그리고 angle_deg만큼 회전한 모양을 저장.
-    (각도는 +면 위로, -면 아래로)
+    투명 PNG에 오른쪽(→) 화살표를 그리고 angle_deg 만큼 회전하여 저장.
+    ✅ 규칙:
+      +각도 = 위쪽(↗)  (PIL rotate는 +가 CCW)
+      -각도 = 아래쪽(↘)
     """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -270,40 +269,38 @@ def _draw_arrow_png(path: str, angle_deg: float, size: int = 160) -> None:
     length = int(size * 0.35)
     thickness = max(3, size // 28)
 
-    # 기본: 오른쪽 화살표(0도)
+    # 기본: 오른쪽 화살표(0°)
     x1, y1 = cx - length, cy
     x2, y2 = cx + length, cy
 
-    # 선
     d.line((x1, y1, x2, y2), fill=(255, 255, 255, 255), width=thickness)
 
-    # 화살촉
     head = int(size * 0.12)
     d.line((x2, y2, x2 - head, y2 - head // 2), fill=(255, 255, 255, 255), width=thickness)
     d.line((x2, y2, x2 - head, y2 + head // 2), fill=(255, 255, 255, 255), width=thickness)
 
-    # 회전(중심 기준)
-    img = img.rotate(-angle_deg, resample=Image.Resampling.BICUBIC, center=(cx, cy), expand=False)
+    # ✅ 여기 핵심: -가 아니라 +로 회전해야 +각도가 위로 갑니다
+    img = img.rotate(angle_deg, resample=Image.Resampling.BICUBIC, center=(cx, cy), expand=False)
     img.save(path, "PNG")
 
 
-def _get_arrow_image_path(angle_deg: float) -> str:
+def _get_arrow_image_path_10(angle_deg: float) -> Optional[str]:
     """
-    버킷(5~70)과 부호에 따라 캐시된 PNG를 반환.
-    없으면 생성.
+    10°~90° 버킷의 up/down 이미지(총 18장)를 사용.
+    - 보합(|angle|<5°)은 None 반환 → 별도 '→' 처리
     """
     _ensure_dirs()
-    sign, bucket = _bucket_angle_deg(angle_deg)
-    # 부호별 파일명(실제로는 14개(버킷) + 필요시 down도 생성)
-    # 사용자가 "14개"를 원한 취지를 살려, 기본은 magnitude 14개를 만들고,
-    # down은 필요할 때만 생성(파일 수는 늘 수 있음)
-    tag = "up" if sign >= 0 else "down"
+    sign, bucket = _bucket_angle_deg_10(angle_deg)
+    if sign == 0:
+        return None
+
+    tag = "up" if sign > 0 else "down"
     fname = f"{tag}_{bucket:02d}.png"
     path = os.path.join(ARROW_DIR, fname)
 
     if not os.path.exists(path):
-        # up: +bucket도, down: -bucket도
-        ang = float(bucket) if sign >= 0 else -float(bucket)
+        # up은 +bucket, down은 -bucket로 생성
+        ang = float(bucket) if sign > 0 else -float(bucket)
         _draw_arrow_png(path, ang)
 
     return path
@@ -311,38 +308,49 @@ def _get_arrow_image_path(angle_deg: float) -> str:
 
 def _build_trend_panel(angle15: float, angle30: float) -> str:
     """
-    15D/30D 화살표 2개를 한 이미지로 합쳐서 저장.
+    15D/30D 방향 이미지를 하나의 패널(trend.png)로 합쳐 저장.
+    - 보합은 '→' 텍스트로 표시 (이미지 없이)
     """
     _ensure_dirs()
-    img15 = Image.open(_get_arrow_image_path(angle15)).convert("RGBA")
-    img30 = Image.open(_get_arrow_image_path(angle30)).convert("RGBA")
 
-    W, H = 420, 220
+    p15 = _get_arrow_image_path_10(angle15)
+    p30 = _get_arrow_image_path_10(angle30)
+
+    W, H = 420, 230
     panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
     d = ImageDraw.Draw(panel)
 
-    # 폰트(시스템 기본)
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 22)
         font_small = ImageFont.truetype("DejaVuSans.ttf", 16)
+        font_mid = ImageFont.truetype("DejaVuSans.ttf", 18)
     except Exception:
         font = ImageFont.load_default()
         font_small = ImageFont.load_default()
+        font_mid = ImageFont.load_default()
 
-    # 타이틀
-    d.text((16, 12), "Trend Direction", fill=(255, 255, 255, 255), font=font)
+    d.text((16, 12), "Trend Direction (10° buckets)", fill=(255, 255, 255, 255), font=font)
 
-    # 라벨 + 이미지 배치
-    d.text((40, 70), "15D", fill=(255, 255, 255, 255), font=font)
-    d.text((250, 70), "30D", fill=(255, 255, 255, 255), font=font)
+    # 라벨
+    d.text((55, 65), "15D", fill=(255, 255, 255, 255), font=font)
+    d.text((265, 65), "30D", fill=(255, 255, 255, 255), font=font)
 
-    panel.alpha_composite(img15, (30, 95))
-    panel.alpha_composite(img30, (240, 95))
+    # 15D
+    if p15:
+        img15 = Image.open(p15).convert("RGBA")
+        panel.alpha_composite(img15, (30, 90))
+    else:
+        d.text((70, 120), "→", fill=(255, 255, 255, 255), font=font_mid)
 
-    # 안내(각도 숫자는 메시지에 그대로 있고, 여기서는 방향만)
-    d.text((16, 195), "Arrows are bucketed to 5° steps (5°~70°).", fill=(200, 200, 200, 255), font=font_small)
+    # 30D
+    if p30:
+        img30 = Image.open(p30).convert("RGBA")
+        panel.alpha_composite(img30, (240, 90))
+    else:
+        d.text((280, 120), "→", fill=(255, 255, 255, 255), font=font_mid)
 
-    os.makedirs(ASSET_DIR, exist_ok=True)
+    d.text((16, 205), "Up=+angle  Down=-angle  Flat(|angle|<5°)=→", fill=(200, 200, 200, 255), font=font_small)
+
     panel.save(TREND_IMAGE_PATH, "PNG")
     return TREND_IMAGE_PATH
 
