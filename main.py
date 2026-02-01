@@ -21,11 +21,10 @@ load_dotenv()
 STATE_FILE = "state.json"
 ASSET_DIR = "assets"
 ARROW_DIR = os.path.join(ASSET_DIR, "arrows")
-TREND_IMAGE_PATH = os.path.join(ASSET_DIR, "trend.png")
 
 URGENT_PCT = 0.5  # 직전 대비 ±0.5% 이상이면 긴급
 
-# ✅ 추가 통화
+# ✅ 통화
 CURRENCIES = [
     ("JPY(100)", "JPY100"),
     ("USD", "USD"),
@@ -103,6 +102,81 @@ def _trend_window(data: List[float], window_n: int, half_days: float) -> Optiona
     }
 
 
+def _sign_pct(p: Optional[float], eps: float = 0.01) -> int:
+    """
+    pct_per_day 기준으로 상승/하락/보합 판정.
+    eps=0.01%/day 이하를 보합으로 봄(노이즈 컷)
+    """
+    if p is None:
+        return 0
+    if p > eps:
+        return 1
+    if p < -eps:
+        return -1
+    return 0
+
+
+def _interpretation_label_7(t15: Optional[Dict[str, float]], t30: Optional[Dict[str, float]]) -> str:
+    """
+    해석지표 7개:
+    - 상승유지
+    - 상승율 둔화
+    - 하락 전환
+    - 보합
+    - 상승전환
+    - 하락 유지
+    - 하락율 둔화
+    """
+    if t15 is None or t30 is None:
+        return "보합"
+
+    p15 = t15.get("pct_per_day")
+    p30 = t30.get("pct_per_day")
+
+    s15 = _sign_pct(p15)
+    s30 = _sign_pct(p30)
+
+    # 보합(둘 중 하나라도 거의 0이면 보합으로 처리)
+    if s15 == 0 and s30 == 0:
+        return "보합"
+    if s15 == 0 and s30 != 0:
+        # 장기방향 있는데 단기는 멈춤 -> 둔화로 보는 게 자연스러움
+        return "상승율 둔화" if s30 > 0 else "하락율 둔화"
+    if s30 == 0 and s15 != 0:
+        # 장기는 flat인데 단기가 움직임 -> 전환 성격
+        return "상승전환" if s15 > 0 else "하락 전환"
+
+    # 변곡(주인님 조건)
+    if s30 > 0 and s15 < 0:
+        return "하락 전환"
+    if s30 < 0 and s15 > 0:
+        return "상승전환"
+
+    # 같은 방향이면 "유지" vs "둔화"를 비교로 나눔
+    # - 상승: 단기 상승률이 장기보다 약하면 둔화, 강하면 유지
+    # - 하락: 단기 하락률(|p15|)이 장기보다 약하면 둔화, 강하면 유지
+    if s30 > 0 and s15 > 0:
+        if (p15 is not None) and (p30 is not None) and (p15 < p30):
+            return "상승율 둔화"
+        return "상승유지"
+
+    if s30 < 0 and s15 < 0:
+        ap15 = abs(p15) if p15 is not None else 0.0
+        ap30 = abs(p30) if p30 is not None else 0.0
+        if ap15 < ap30:
+            return "하락율 둔화"
+        return "하락 유지"
+
+    return "보합"
+
+
+def _fmt_pct(p: Optional[float]) -> str:
+    if p is None:
+        return "N/A"
+    sign = "+" if p >= 0 else "-"
+    return f"{sign}{abs(p):.3f}%/day"
+
+
 # ================= 환율 API =================
 
 def _fetch_ap01_for_date(searchdate: str, authkey: str) -> List[Dict[str, Any]]:
@@ -124,15 +198,11 @@ def _extract_rates(items: List[Dict[str, Any]], cur_unit: str) -> Optional[Dict[
             ttb = _to_float(item.get("ttb"))
             tts = _to_float(item.get("tts"))
             mid = (ttb + tts) / 2.0 if (ttb is not None and tts is not None) else None
-            return {"deal": deal, "mid": mid, "ttb": ttb, "tts": tts}
+            return {"deal": deal, "mid": mid}
     return None
 
 
 def fetch_latest_rates_with_date() -> Tuple[Dict[str, Dict[str, Optional[float]]], str]:
-    """
-    최근 7일(주말/공휴일 포함) 중 데이터 있는 날짜를 찾아,
-    지정 통화들의 deal/mid를 한 번에 가져옵니다.
-    """
     authkey = os.getenv("EXIMBANK_API_KEY", "").strip()
     if not authkey:
         raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
@@ -168,15 +238,10 @@ def fetch_latest_rates_with_date() -> Tuple[Dict[str, Dict[str, Optional[float]]
 # ================= 부트스트랩 (초기 30일 채우기) =================
 
 def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str, List[float]]:
-    """
-    각 통화별 CSV가 부족하면:
-    과거 '일 단위 deal'을 가져와 하루값을 48번 반복하여 1440개로 채움.
-    """
     authkey = os.getenv("EXIMBANK_API_KEY", "").strip()
     if not authkey:
         raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
 
-    # 어떤 통화가 부족한지 체크
     need_codes = [code for _, code in CURRENCIES if len(series_map.get(code, [])) < MAX_30D]
     if not need_codes:
         return series_map
@@ -186,7 +251,6 @@ def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str
 
     prefix_map: Dict[str, List[float]] = {code: [] for code in need_codes}
 
-    # 주말/공휴일 고려해 넉넉히 120일 범위
     for day_back in range(1, 120):
         if all(len(prefix_map[c]) >= MAX_30D for c in need_codes):
             break
@@ -200,11 +264,8 @@ def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str
                 continue
 
             for cur_unit, code in CURRENCIES:
-                if code not in need_codes:
+                if code not in need_codes or len(prefix_map[code]) >= MAX_30D:
                     continue
-                if len(prefix_map[code]) >= MAX_30D:
-                    continue
-
                 r = _extract_rates(items, cur_unit)
                 if r and r.get("deal") is not None:
                     prefix_map[code].extend([float(r["deal"])] * 48)
@@ -214,7 +275,6 @@ def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str
             time.sleep(0.25)
             continue
 
-    # prefix_map은 "최근 과거 → 더 과거" 순으로 쌓였으니 뒤집어서 과거→최근 정렬
     for code in need_codes:
         prefix_map[code] = list(reversed(prefix_map[code]))
         existing = series_map.get(code, [])
@@ -226,15 +286,14 @@ def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str
 # ================= 신호 판정 =================
 
 def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float):
-    # 30D 우선
     if a30 is not None and price < a30 * th:
-        return "BUY30", "📉 매수 신호 (30D)"
+        return "BUY30", "BUY30"
     if a15 is not None and price < a15 * th:
-        return "BUY15", "📉 매수 신호 (15D)"
+        return "BUY15", "BUY15"
     if a30 is not None and price > a30 * th:
-        return "SELL30", "📈 매도 신호 (30D)"
+        return "SELL30", "SELL30"
     if a15 is not None and price > a15 * th:
-        return "SELL15", "📈 매도 신호 (15D)"
+        return "SELL15", "SELL15"
     return "NONE", None
 
 
@@ -275,7 +334,6 @@ def _draw_arrow_png(path: str, angle_deg: float, size: int = 120) -> None:
     d.line((x2, y2, x2 - head, y2 - head // 2), fill=(255, 255, 255, 255), width=thickness)
     d.line((x2, y2, x2 - head, y2 + head // 2), fill=(255, 255, 255, 255), width=thickness)
 
-    # +각도=위, -각도=아래
     img = img.rotate(angle_deg, resample=Image.Resampling.BICUBIC, center=(cx, cy), expand=False)
     img.save(path, "PNG")
 
@@ -294,15 +352,16 @@ def _get_arrow_image_path_10(angle_deg: float) -> Optional[str]:
     return path
 
 
-def _build_multi_trend_panel(angle_map_15: Dict[str, float], angle_map_30: Dict[str, float]) -> str:
+def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
     """
-    4개 통화를 한 장에 표처럼 구성:
-    rows: 통화, cols: 15D / 30D
+    통화 1개용 이미지: (30D, 15D) 화살표를 한 장에 배치
     """
     _ensure_dirs()
 
-    rows = [code for _, code in CURRENCIES]
-    W, H = 520, 70 + 120 * len(rows)
+    p15 = _get_arrow_image_path_10(angle15)
+    p30 = _get_arrow_image_path_10(angle30)
+
+    W, H = 420, 220
     panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
     d = ImageDraw.Draw(panel)
 
@@ -315,40 +374,31 @@ def _build_multi_trend_panel(angle_map_15: Dict[str, float], angle_map_30: Dict[
         font_mid = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    d.text((16, 12), "Trend Direction (10° buckets)", fill=(255, 255, 255, 255), font=font)
-    d.text((220, 42), "15D", fill=(255, 255, 255, 255), font=font_mid)
-    d.text((390, 42), "30D", fill=(255, 255, 255, 255), font=font_mid)
+    d.text((16, 12), f"{code} Trend (10° buckets)", fill=(255, 255, 255, 255), font=font)
 
-    y = 70
-    for code in rows:
-        d.text((16, y + 42), code, fill=(255, 255, 255, 255), font=font_mid)
+    # 라벨: 주인님 요청대로 30D / 15D
+    d.text((70, 60), "30D", fill=(255, 255, 255, 255), font=font_mid)
+    d.text((265, 60), "15D", fill=(255, 255, 255, 255), font=font_mid)
 
-        a15 = angle_map_15.get(code, 0.0)
-        a30 = angle_map_30.get(code, 0.0)
+    # 30D (왼쪽)
+    if p30:
+        img30 = Image.open(p30).convert("RGBA")
+        panel.alpha_composite(img30, (45, 85))
+    else:
+        d.text((105, 110), "→", fill=(255, 255, 255, 255), font=font_mid)
 
-        p15 = _get_arrow_image_path_10(a15)
-        p30 = _get_arrow_image_path_10(a30)
+    # 15D (오른쪽)
+    if p15:
+        img15 = Image.open(p15).convert("RGBA")
+        panel.alpha_composite(img15, (240, 85))
+    else:
+        d.text((300, 110), "→", fill=(255, 255, 255, 255), font=font_mid)
 
-        if p15:
-            img15 = Image.open(p15).convert("RGBA")
-            panel.alpha_composite(img15, (200, y))
-        else:
-            d.text((240, y + 46), "→", fill=(255, 255, 255, 255), font=font_mid)
+    d.text((16, 195), "Up=+angle  Down=-angle  Flat(|angle|<5°)=→", fill=(200, 200, 200, 255), font=font_small)
 
-        if p30:
-            img30 = Image.open(p30).convert("RGBA")
-            panel.alpha_composite(img30, (370, y))
-        else:
-            d.text((410, y + 46), "→", fill=(255, 255, 255, 255), font=font_mid)
-
-        # 구분선
-        d.line((16, y + 118, W - 16, y + 118), fill=(60, 60, 60, 255), width=1)
-        y += 120
-
-    d.text((16, H - 22), "Up=+angle  Down=-angle  Flat(|angle|<5°)=→", fill=(200, 200, 200, 255), font=font_small)
-
-    panel.save(TREND_IMAGE_PATH, "PNG")
-    return TREND_IMAGE_PATH
+    path = os.path.join(ASSET_DIR, f"trend_{code}.png")
+    panel.save(path, "PNG")
+    return path
 
 
 # ================= 메인 =================
@@ -361,171 +411,118 @@ def main():
     for _, code in CURRENCIES:
         series_map[code] = load_data(_csv_name(code))
 
-    # 2) 부족하면 30일(1440개) 부트스트랩
+    # 2) 부족하면 30일 부트스트랩
     if any(len(series_map[code]) < MAX_30D for _, code in CURRENCIES):
         try:
             series_map = bootstrap_fill_30d_if_needed(series_map)
             for _, code in CURRENCIES:
                 save_data(series_map[code], _csv_name(code))
         except Exception as e:
-            # 부트스트랩 실패는 긴급이 아니라서 텍스트 1회만
             send_message(f"⚠️ 부트스트랩 실패(과거데이터 채우기)\n{e}")
 
-    # 3) 최신 환율 가져오기(한 번에)
+    # 3) 최신 환율(한 번에)
     try:
         latest_map, used_date = fetch_latest_rates_with_date()
     except Exception as e:
         send_message(f"⚠️ 환율 수신 실패\n{e}")
         return
 
-    # 4) 긴급 체크(직전 대비 ±0.5%) — 통화별로
+    # 4) 긴급 체크(직전 대비)
     urgent_lines: List[str] = []
     urgent_any = False
-
     for cur_unit, code in CURRENCIES:
-        if code not in latest_map:
+        r = latest_map.get(code)
+        if not r or r.get("deal") is None:
             continue
 
-        price = latest_map[code]["deal"]
-        if price is None:
-            continue
-
-        series = series_map.get(code, [])
-        prev_price = series[-1] if series else None
+        price = float(r["deal"])
+        prev_series = series_map.get(code, [])
+        prev_price = prev_series[-1] if prev_series else None
 
         if prev_price is not None and prev_price != 0:
             pct = (price - prev_price) / prev_price * 100.0
             if abs(pct) >= URGENT_PCT:
                 urgent_any = True
-                direction = "상승" if pct > 0 else "하락"
-                urgent_lines.append(
-                    f"- {code}: {prev_price:.4f} → {price:.4f} ({pct:+.3f}%, {direction})"
-                )
+                direction = "UP" if pct > 0 else "DOWN"
+                urgent_lines.append(f"- {code}: {prev_price:.4f} → {price:.4f} ({pct:+.3f}%, {direction})")
 
-    # 5) 데이터 반영(30분마다 1개 append) + 저장
+    # 5) 데이터 반영 + 저장
     for cur_unit, code in CURRENCIES:
-        if code not in latest_map:
+        r = latest_map.get(code)
+        if not r or r.get("deal") is None:
             continue
-        price = latest_map[code]["deal"]
-        if price is None:
-            continue
-        series_map[code] = append_and_trim(series_map.get(code, []), float(price), MAX_30D)
+        price = float(r["deal"])
+        series_map[code] = append_and_trim(series_map.get(code, []), price, MAX_30D)
         save_data(series_map[code], _csv_name(code))
 
-    # 6) 긴급이 있으면: “긴급만” 발송하고 리포트는 스킵 (주인님 요청)
+    # 6) 긴급이면: 긴급만 1건 (기존 정책 유지)
     if urgent_any:
-        msg = [
-            "🚨 긴급 환율 변동",
+        msg = "\n".join([
+            "🚨 URGENT FX MOVE",
             "----------------------",
-            f"기준일: {used_date}",
-            "기준: 매매기준율(deal_bas_r)",
+            f"date: {used_date}",
+            "basis: deal_bas_r",
             "",
             *urgent_lines
-        ]
-        send_message("\n".join(msg))
+        ])
+        send_message(msg)
         return
 
-    # 7) 신호(매수/매도) 통화만 모아서 리포트 1건 발송
+    # 7) 신호가 있는 통화만 “통화별 메시지 + 통화별 이미지”로 발송
     state_map = load_state()
-    report_lines: List[str] = []
-    angle15_map: Dict[str, float] = {}
-    angle30_map: Dict[str, float] = {}
-
-    any_signal = False
 
     for cur_unit, code in CURRENCIES:
-        if code not in latest_map:
+        r = latest_map.get(code)
+        if not r or r.get("deal") is None:
             continue
 
         series = series_map.get(code, [])
         if not series:
             continue
 
-        price = float(latest_map[code]["deal"])
-        mid = latest_map[code].get("mid")
-
-        a15_show = avg_last_partial(series, MAX_15D)
-        a30_show = avg_last_partial(series, MAX_30D)
+        price = float(r["deal"])
 
         a15 = avg_last(series, MAX_15D)
         a30 = avg_last(series, MAX_30D)
 
+        # 신호
+        state, sig = decide_signal(price, a15, a30, th)
+        if sig is None:
+            continue  # ✅ 신호 있을 때만 발송(스팸 방지)
+
+        # 추세(15/30)
         t15 = _trend_window(series, MAX_15D, half_days=7.5)
         t30 = _trend_window(series, MAX_30D, half_days=15.0)
 
-        state, sig = decide_signal(price, a15, a30, th)
-        if not sig:
-            # 이미지에는 방향을 계속 찍고 싶으면 여기서도 넣을 수 있지만,
-            # 주인님은 “신호 있을 때만” 리포트라서 이미지도 신호 있을 때만 보냅니다.
-            continue
+        # 해석지표(7개 중 1개)
+        indicator = _interpretation_label_7(t15, t30)
 
-        any_signal = True
+        # 30D/15D “상승/하락율” = pct_per_day 사용
+        p30 = t30["pct_per_day"] if t30 else None
+        p15 = t15["pct_per_day"] if t15 else None
 
-        # state 중복 방지(통화별)
+        # ✅ 주인님 요청: 텍스트 3줄만
+        # 1) CODE: 현재가 (해석지표 1개 + BUY/SELL)
+        # 2) 30day: +/- 하락율
+        # 3) 15day: +/- 하락율
+        line1 = f"{code}: {price:.4f} ({indicator}, {sig})"
+        line2 = f"30day: {_fmt_pct(p30)}"
+        line3 = f"15day: {_fmt_pct(p15)}"
+        text = "\n".join([line1, line2, line3])
+
+        # 이미지(30D, 15D) — 통화별 1장
+        angle15 = float(t15["angle_deg"]) if t15 else 0.0
+        angle30 = float(t30["angle_deg"]) if t30 else 0.0
+        img_path = _build_currency_trend_panel(code, angle15=angle15, angle30=angle30)
+
+        # state 저장(통화별)
         prev_state = state_map.get(code, "NONE")
         if state != prev_state:
             state_map[code] = state
 
-        report_lines.append(f"## {code}")
-        report_lines.append(f"- 현재(deal): {price:.4f}")
-        report_lines.append(f"- 중간값(mid): {mid:.4f}" if mid is not None else "- 중간값(mid): N/A")
-        report_lines.append(f"- 15D 평균: {a15_show:.4f}" if a15_show is not None else "- 15D 평균: N/A")
-        report_lines.append(f"- 30D 평균: {a30_show:.4f}" if a30_show is not None else "- 30D 평균: N/A")
-        report_lines.append(f"- 데이터: {len(series)}/{MAX_30D}")
+        send_message(text, file_path=img_path, filename=f"trend_{code}.png")
 
-        if t15 is not None:
-            direction15 = "하락추세" if t15["a_last"] < t15["a_first"] else "상승/횡보"
-            report_lines.append(
-                f"- 추세(15D): {direction15} | 전반7.5D {t15['a_first']:.4f} → 후반7.5D {t15['a_last']:.4f}"
-            )
-            report_lines.append(
-                f"  - 기울기(15D): {t15['slope_per_day']:+.4f} 원/일 ({t15['pct_per_day']:+.3f}%/일) | 각도: {t15['angle_deg']:+.2f}°"
-            )
-            angle15_map[code] = float(t15["angle_deg"])
-        else:
-            report_lines.append("- 추세(15D): 데이터 부족")
-            angle15_map[code] = 0.0
-
-        if t30 is not None:
-            direction30 = "하락추세" if t30["a_last"] < t30["a_first"] else "상승/횡보"
-            report_lines.append(
-                f"- 추세(30D): {direction30} | 전반15D {t30['a_first']:.4f} → 후반15D {t30['a_last']:.4f}"
-            )
-            report_lines.append(
-                f"  - 기울기(30D): {t30['slope_per_day']:+.4f} 원/일 ({t30['pct_per_day']:+.3f}%/일) | 각도: {t30['angle_deg']:+.2f}°"
-            )
-            angle30_map[code] = float(t30["angle_deg"])
-        else:
-            report_lines.append("- 추세(30D): 데이터 부족")
-            angle30_map[code] = 0.0
-
-        report_lines.append(f"- 신호: {sig}")
-        report_lines.append("")
-
-    if any_signal:
-        # state 저장
-        save_state_map(state_map)
-
-        header = [
-            "📊 환율 신호 리포트 (신호 발생 통화만)",
-            "----------------------",
-            f"기준일: {used_date}",
-            "기준: 매매기준율(deal_bas_r)",
-            ""
-        ]
-        msg = "\n".join(header + report_lines).strip()
-
-        # 신호 통화들만 이미지 구성(표 형태)
-        try:
-            # angle_map에 없는 통화는 0으로
-            for _, code in CURRENCIES:
-                angle15_map.setdefault(code, 0.0)
-                angle30_map.setdefault(code, 0.0)
-
-            img_path = _build_multi_trend_panel(angle15_map, angle30_map)
-            send_message(msg, file_path=img_path, filename="trend.png")
-        except Exception as e:
-            send_message(msg + f"\n(이미지 생성 실패: {e})")
+    save_state_map(state_map)
 
 
 if __name__ == "__main__":
