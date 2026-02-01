@@ -1,3 +1,4 @@
+// PWA Service Worker (shell 단계)
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
