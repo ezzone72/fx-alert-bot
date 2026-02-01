@@ -1,16 +1,19 @@
-name: FX Alert Bot
+name: fx-alert-bot
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   workflow_dispatch:
+  schedule:
+    # every 30 minutes
+    - cron: "*/30 * * * *"
 
+# ✅ push(커밋/푸시) 하려면 반드시 필요
 permissions:
   contents: write
 
+# ✅ 실행이 겹치면 알림이 중복될 수 있으니, 겹치기 방지(권장)
 concurrency:
   group: fx-alert-bot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -21,61 +24,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Test Discord webhook
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          python - << 'PY'
-          import os, requests, datetime
-          url = os.getenv("DISCORD_WEBHOOK_URL","").strip()
-          assert url, "DISCORD_WEBHOOK_URL secret missing"
-          msg = "✅ fx-alert-bot ping " + datetime.datetime.utcnow().isoformat() + "Z"
-          r = requests.post(url, json={"content": msg}, timeout=15)
-          print("status:", r.status_code)
-          r.raise_for_status()
-          PY
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests python-dotenv pillow
+          fi
 
       - name: Run bot
         env:
           EXIMBANK_API_KEY: ${{ secrets.EXIMBANK_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          THRESHOLD: ${{ secrets.THRESHOLD }}
+          THRESHOLD: ${{ vars.THRESHOLD }}
         run: |
           python main.py
 
-      - name: Debug files
-        run: |
-          echo "PWD=$(pwd)"
-          echo "==== ls -la (repo root) ===="
-          ls -la
-          echo "==== find data/state ===="
-          find . -maxdepth 2 -type f \( -name "data.csv" -o -name "state.json" \) -print
-
-      - name: Commit rolling files if changed
+      # ✅ 핵심: state.json + data_*.csv 를 레포에 남겨서 "방향 전환 중복방지"가 다음 실행에도 유지되게 함
+      - name: Persist state (csv + state.json)
         run: |
           git config user.name "fx-alert-bot"
           git config user.email "fx-alert-bot@users.noreply.github.com"
 
-          # 파일이 존재할 때만 add (없으면 조용히 넘어감)
-          [ -f data.csv ] && git add data.csv || true
-          [ -f state.json ] && git add state.json || true
+          # 없으면 만들어두기(첫 실행/첫 신호 대비)
+          test -f state.json || echo "{}" > state.json
 
-          # 변경 없으면 종료
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
+          # 통화별 CSV와 상태만 저장(이미지는 저장 안 함)
+          git add state.json data_*.csv || true
 
-          git commit -m "chore: update rolling fx data [skip ci]"
+          # 변경 없으면 커밋/푸시 생략
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "Update fx state"
           git push
