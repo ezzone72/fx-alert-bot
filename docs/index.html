@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>FX Alert PWA</title>
 
-  <link rel="manifest" href="./manifest.json" />
+  <link rel="manifest" href="/fx-alert-bot/manifest.json" />
   <meta name="theme-color" content="#111111" />
 
   <style>
@@ -13,6 +13,10 @@
     .wrap { max-width:720px; margin:0 auto; padding:24px; }
     .card { background:#141414; border:1px solid #2a2a2a; border-radius:14px; padding:16px; margin:12px 0; }
     .muted { color:#aaa; font-size: 14px; }
+    button { background:#2b72ff; color:#fff; border:0; padding:12px 14px; border-radius:12px; font-weight:700; cursor:pointer; }
+    code { background:#111; padding:2px 6px; border-radius:8px; }
+    .ok { color:#7CFF7C; }
+    .bad { color:#FF7C7C; }
   </style>
 </head>
 <body>
@@ -22,27 +26,43 @@
     <div class="card">
       <h3>설치</h3>
       <p class="muted">
-        Android: Chrome → <b>⋮ → 홈 화면에 추가</b><br/>
+        Android: Chrome → <b>⋮ → 앱 설치</b> (또는 홈 화면에 추가)<br/>
         iPhone: Safari → <b>공유 → 홈 화면에 추가</b>
+      </p>
+      <p class="muted">
+        설치가 “바로가기”로만 나오면, 아직 PWA 조건을 만족 못한 겁니다(우리가 지금 고치는 중).
       </p>
     </div>
 
     <div class="card">
-      <h3>상태</h3>
-      <p class="muted">이 페이지가 보이면 GitHub Pages 배포 성공입니다.</p>
-      <p class="muted">다음 단계에서 푸시 알림을 붙입니다.</p>
+      <h3>푸시 수신 등록</h3>
+      <p class="muted">등록 버튼을 누르면 알림 권한 요청 → 토큰 발급 → Firestore 저장까지 진행됩니다.</p>
+      <button id="btn">🔔 푸시 등록하기</button>
+      <p id="status" class="muted">상태: 대기</p>
+      <p class="muted">토큰(일부): <code id="tokenPreview">-</code></p>
     </div>
 
     <div class="card">
       <h3>버전</h3>
-      <p class="muted">v0.1 (PWA shell)</p>
+      <p class="muted">v0.2 (absolute path + scope fix)</p>
     </div>
   </div>
 
+  <!-- Firebase compat SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-messaging-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+
+  <!-- ✅ 페이지 스크립트(푸시 등록 로직) -->
+  <script src="/fx-alert-bot/app.js"></script>
+
   <script>
-    // ✅ Service Worker = app.js
+    // ✅ 핵심: GitHub Pages 하위 경로에서 PWA 설치가 되려면
+    // Service Worker를 레포 루트(/fx-alert-bot/) 스코프로 강제해야 합니다.
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("./sw.js").catch(console.error);
+      navigator.serviceWorker
+        .register("/fx-alert-bot/sw.js", { scope: "/fx-alert-bot/" })
+        .catch(console.error);
     }
   </script>
 </body>
