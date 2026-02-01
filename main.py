@@ -53,64 +53,38 @@ def _to_float(x: Any) -> Optional[float]:
 
 
 def _sparkline(series: List[float], width: int = 48) -> str:
-    """
-    텍스트 그래프(스파크라인). width=48이면 최근 24시간(30분봉) 느낌으로 보기 좋음.
-    series가 길면 다운샘플링합니다.
-    """
     if not series:
         return ""
-
-    # 다운샘플: 원하는 폭으로 줄이기
     if len(series) > width:
         step = len(series) / width
-        sampled = []
-        for i in range(width):
-            idx = int(i * step)
-            sampled.append(series[idx])
+        sampled = [series[int(i * step)] for i in range(width)]
     else:
         sampled = series[:]
-
     mn, mx = min(sampled), max(sampled)
     if mx - mn < 1e-9:
         return "▁" * len(sampled)
-
     blocks = "▁▂▃▄▅▆▇█"
     out = []
     for v in sampled:
-        t = (v - mn) / (mx - mn)  # 0..1
+        t = (v - mn) / (mx - mn)
         out.append(blocks[int(t * (len(blocks) - 1))])
     return "".join(out)
 
 
 def _trend_15d(data: List[float]) -> Optional[Dict[str, float]]:
-    """
-    15일(720개) 기준:
-    - 전반 7.5일(360개) 평균 vs 후반 7.5일(360개) 평균 비교
-    - 후반 < 전반이면 하락추세
-    - 기울기(원/일), 각도(도)를 대략 계산
-    """
     if len(data) < MAX_15D:
         return None
-
-    w = data[-MAX_15D:]           # 최근 15일
-    first = w[: MAX_15D // 2]     # 7.5일
-    last = w[MAX_15D // 2 :]      # 7.5일
-
+    w = data[-MAX_15D:]
+    first = w[: MAX_15D // 2]
+    last = w[MAX_15D // 2 :]
     a_first = sum(first) / len(first)
     a_last = sum(last) / len(last)
-
-    # 7.5일 동안 평균이 얼마나 변했는지
     delta = a_last - a_first
     days = 7.5
-    slope_per_day = delta / days  # 원/일 (JPY100 기준)
-
-    # 각도: x=일(day), y=원(KRW) 기준의 기울기 각도(참고용)
+    slope_per_day = delta / days
     import math
     angle_deg = math.degrees(math.atan(slope_per_day))
-
-    # 퍼센트(일): 기준을 전반 평균으로 둠
-    pct_per_day = (slope_per_day / a_first) * 100.0 if a_first != 0 else 0.0
-
+    pct_per_day = (slope_per_day / a_first) * 100.0 if a_first else 0.0
     return {
         "a_first": a_first,
         "a_last": a_last,
@@ -121,60 +95,137 @@ def _trend_15d(data: List[float]) -> Optional[Dict[str, float]]:
     }
 
 
-def fetch_jpy100_item_with_date() -> Tuple[Dict[str, Optional[float]], str]:
+# ========= 환율 API =========
+
+def _fetch_ap01_for_date(searchdate: str, authkey: str) -> List[Dict[str, Any]]:
+    url = "https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON"
+    params = {"authkey": authkey, "searchdate": searchdate, "data": "AP01"}
+    headers = {"User-Agent": "fx-alert-bot"}
+    r = requests.get(url, params=params, headers=headers, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+def _fetch_jpy100_item_exact_date(searchdate: str, authkey: str) -> Optional[Dict[str, Optional[float]]]:
     """
-    최근 7일 중 데이터 있는 날짜를 찾아 JPY(100) 항목(가능하면 ttb/tts/deal)을 반환
+    특정 날짜(YYYYMMDD) 하루치에서 JPY(100) 항목을 찾는다.
+    그 날짜가 주말/공휴일이면 None을 리턴.
+    """
+    items = _fetch_ap01_for_date(searchdate, authkey)
+    if not items:
+        return None
+    for item in items:
+        if item.get("cur_unit") == "JPY(100)":
+            ttb = _to_float(item.get("ttb"))
+            tts = _to_float(item.get("tts"))
+            deal = _to_float(item.get("deal_bas_r"))
+            if deal is None:
+                return None
+            mid = (ttb + tts) / 2.0 if (ttb is not None and tts is not None) else None
+            return {"deal": deal, "ttb": ttb, "tts": tts, "mid": mid}
+    return None
+
+
+def fetch_jpy100_item_with_date_fallback() -> Tuple[Dict[str, Optional[float]], str]:
+    """
+    실시간(현재 실행) 값: 최근 7일에서 데이터 있는 날짜를 찾아 JPY(100)을 가져온다.
     """
     authkey = os.getenv("EXIMBANK_API_KEY", "").strip()
     if not authkey:
         raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
 
-    url = "https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON"
-    headers = {"User-Agent": "fx-alert-bot"}
-
     kst = ZoneInfo("Asia/Seoul")
     today = datetime.now(kst).date()
 
     last_err = None
-
     for day_back in range(0, 7):
         d = today - timedelta(days=day_back)
         searchdate = d.strftime("%Y%m%d")
-        params = {"authkey": authkey, "searchdate": searchdate, "data": "AP01"}
-
         for i in range(3):
             try:
-                r = requests.get(url, params=params, headers=headers, timeout=25)
-                r.raise_for_status()
-                data = r.json()
-
-                if not isinstance(data, list) or len(data) == 0:
+                item = _fetch_jpy100_item_exact_date(searchdate, authkey)
+                if item is None:
                     break
-
-                for item in data:
-                    if item.get("cur_unit") == "JPY(100)":
-                        ttb = _to_float(item.get("ttb"))
-                        tts = _to_float(item.get("tts"))
-                        deal = _to_float(item.get("deal_bas_r"))
-
-                        if deal is None:
-                            raise RuntimeError("deal_bas_r(매매기준율) 파싱 실패")
-
-                        mid = (ttb + tts) / 2.0 if (ttb is not None and tts is not None) else None
-
-                        return {"deal": deal, "ttb": ttb, "tts": tts, "mid": mid}, searchdate
-
-                break
-
+                return item, searchdate
             except Exception as e:
                 last_err = e
-                time.sleep(1.5 * (i + 1))
+                time.sleep(1.2 * (i + 1))
 
     raise RuntimeError(f"최근 7일 내 환율 데이터를 찾지 못했습니다: {last_err}")
 
 
+# ========= 부트스트랩(초기 30일 채우기) =========
+
+def bootstrap_fill_30d_if_needed(data: List[float]) -> List[float]:
+    """
+    data.csv가 비었거나 부족하면:
+    - 과거 '일 단위' 환율을 가져와서 (deal_bas_r 기준)
+    - 하루 값을 48번 반복하여 30분봉처럼 채운 뒤
+    - 총 1440개(30일) 되도록 앞쪽(과거)에 채움
+    """
+    if len(data) >= MAX_30D:
+        return data
+
+    authkey = os.getenv("EXIMBANK_API_KEY", "").strip()
+    if not authkey:
+        raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
+
+    need = MAX_30D - len(data)
+    days_needed = (need + 47) // 48  # ceil
+
+    kst = ZoneInfo("Asia/Seoul")
+    today = datetime.now(kst).date()
+
+    prefix: List[float] = []
+    got_days = 0
+
+    # 주말/공휴일 감안해 넉넉히 90일 범위 탐색(영업일 30일 확보용)
+    # (처음 한 번만 실행)
+    for day_back in range(1, 90 + 1):
+        if got_days >= days_needed:
+            break
+
+        d = today - timedelta(days=day_back)
+        searchdate = d.strftime("%Y%m%d")
+
+        try:
+            item = _fetch_jpy100_item_exact_date(searchdate, authkey)
+            if item is None:
+                continue  # 데이터 없는 날(주말/공휴일) 스킵
+
+            deal = item["deal"]
+            if deal is None:
+                continue
+
+            prefix.extend([deal] * 48)
+            got_days += 1
+
+            # 너무 빠른 연속 호출 방지(서버 예의)
+            time.sleep(0.15)
+
+        except Exception:
+            # 일시적 네트워크 에러면 그냥 넘어가서 다음 날 시도
+            time.sleep(0.3)
+            continue
+
+    if not prefix:
+        # 그래도 못 채우면 기존 data 그대로
+        return data
+
+    # prefix는 과거→최근 순으로 쌓였어야 하는데, 우리는 과거부터 훑어서 이미 그 순서입니다.
+    # (today-1, today-2...로 가면 역순이므로, 실제로는 뒤집어야 “과거→최근”이 됨)
+    # 현재 loop는 day_back=1부터 증가하니 prefix는 "최근 과거 → 더 과거" 순으로 들어감
+    # 따라서 뒤집어서 과거→최근으로 정렬
+    prefix = list(reversed(prefix))
+
+    data = (prefix + data)[-MAX_30D:]
+    return data
+
+
+# ========= 신호 판정 =========
+
 def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float):
-    # 기존 로직 유지(30D 우선)
     if a30 is not None and price < a30 * th:
         return "BUY30", "📉 매수 신호 (30D)"
     if a15 is not None and price < a15 * th:
@@ -189,34 +240,45 @@ def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: 
 def main():
     th = _get_threshold()
 
+    # 1) CSV 로드
+    data = load_data()
+
+    # 2) 처음엔 30일(1440개) 부트스트랩(과거 일단위 값을 48번 반복)
+    if len(data) < MAX_30D:
+        try:
+            data = bootstrap_fill_30d_if_needed(data)
+            save_data(data)
+        except Exception as e:
+            send_message(f"⚠️ 부트스트랩 실패(과거데이터 채우기)\n{e}")
+
+    # 3) 최신 값(최근 7일 fallback) 가져오기
     try:
-        rates, used_date = fetch_jpy100_item_with_date()
+        rates, used_date = fetch_jpy100_item_with_date_fallback()
     except Exception as e:
         send_message(f"⚠️ 환율 수신 실패\n{e}")
         return
 
-    # ✅ 기준 환율로 통일: deal_bas_r(매매기준율)
+    # ✅ 기준환율: deal_bas_r(매매기준율)
     price = rates["deal"]
+    if price is None:
+        send_message("⚠️ deal_bas_r(매매기준율) 값이 없습니다.")
+        return
 
-    # 데이터 누적/슬라이딩
-    data = load_data()
+    # 4) 30분마다 1개 추가(슬라이딩)
     data = append_and_trim(data, price)
     save_data(data)
 
-    # 표시용 평균(부분)
+    # 평균(표시용)
     a15_show = avg_last_partial(data, MAX_15D)
     a30_show = avg_last_partial(data, MAX_30D)
 
-    # 판정용 평균(정식: 충분할 때만)
+    # 평균(판정용)
     a15 = avg_last(data, MAX_15D)
     a30 = avg_last(data, MAX_30D)
 
     is_test = len(data) < MAX_15D
 
-    # 추세 분석(15일 이상일 때만)
     trend = _trend_15d(data)
-
-    # 최근 24시간 텍스트 그래프(48개 = 24시간)
     last_48 = data[-48:] if len(data) >= 48 else data[:]
     chart = _sparkline(last_48, width=min(48, len(last_48))) if last_48 else ""
 
@@ -229,7 +291,7 @@ def main():
     lines.append(f"기준일: {used_date}")
     lines.append(f"매매기준율(deal): {price:.4f}")
 
-    # ✅ 중간값은 “한 줄”만
+    # ✅ 중간값 한 줄(있을 때만)
     if rates.get("mid") is not None:
         lines.append(f"중간값(mid=(TTB+TTS)/2): {rates['mid']:.4f}")
     else:
@@ -239,7 +301,6 @@ def main():
     lines.append(f"30D 평균(현재까지): {a30_show:.4f}" if a30_show is not None else "30D 평균(현재까지): N/A")
     lines.append(f"데이터: {len(data)}/{MAX_30D} (30분봉)")
 
-    # ✅ 추세 안내 문구
     if trend is None:
         lines.append("추세: 데이터 부족(15일 이상 필요)")
     else:
@@ -251,11 +312,9 @@ def main():
             f"기울기: {trend['slope_per_day']:+.4f} 원/일 ({trend['pct_per_day']:+.3f}%/일) | 각도: {trend['angle_deg']:+.2f}°"
         )
 
-    # ✅ 텍스트 그래프(최근 24h)
     if chart:
         lines.append(f"최근 24h: {chart}")
 
-    # 매수/매도 신호(기존 로직)
     state, sig = decide_signal(price, a15, a30, th)
     if sig:
         lines.append(sig)
