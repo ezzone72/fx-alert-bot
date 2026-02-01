@@ -13,6 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+- name: Test Discord webhook
+  env:
+    DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
   run:
     runs-on: ubuntu-latest
     steps:
