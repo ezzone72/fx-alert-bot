@@ -2,6 +2,7 @@ import json
 import os
 from typing import Optional, Tuple
 
+import time
 import requests
 from dotenv import load_dotenv
 
@@ -37,22 +38,31 @@ def fetch_jpy100_krw() -> Optional[float]:
     if not authkey:
         raise RuntimeError("EXIMBANK_API_KEY가 비어 있습니다.")
 
+    # ✅ 2025-06-25 도메인 변경: www -> oapi (공공데이터포털 공지)
     url = "https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON"
-
     params = {"authkey": authkey, "searchdate": "", "data": "AP01"}
 
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    headers = {
+        "User-Agent": "fx-alert-bot/1.0 (+github-actions)"
+    }
 
-    for item in data:
-        if item.get("cur_unit") == "JPY(100)":
-            s = str(item.get("deal_bas_r", "")).replace(",", "").strip()
-            try:
-                return float(s)
-            except ValueError:
-                return None
-    return None
+    last_err = None
+    for i in range(5):  # 최대 5회 시도
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+            for item in data:
+                if item.get("cur_unit") == "JPY(100)":
+                    s = str(item.get("deal_bas_r", "")).replace(",", "").strip()
+                    return float(s)
+            return None
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (i + 1))  # 2s,4s,6s,8s,10s
+
+    raise RuntimeError(f"환율 API 호출 실패(재시도 초과): {last_err}")
+
 
 def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float) -> Tuple[str, Optional[str]]:
     # 우선순위: 30일 > 15일
