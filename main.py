@@ -21,9 +21,8 @@ STATE_FILE = "state.json"
 ASSET_DIR = "assets"
 ARROW_DIR = os.path.join(ASSET_DIR, "arrows")
 
-URGENT_PCT = 0.5  # 직전 대비 ±0.5% 이상이면 긴급 (긴급이면 리포트 스킵)
+URGENT_PCT = 0.5  # 직전 대비 ±0.5% 이상이면 긴급(긴급만 발송)
 
-# 통화: (EximBank cur_unit, internal code for filenames/messages)
 CURRENCIES = [
     ("JPY(100)", "JPY100"),
     ("USD", "USD"),
@@ -56,6 +55,11 @@ def _csv_name(code: str) -> str:
 
 
 def load_state() -> Dict[str, str]:
+    """
+    state.json example:
+      {"USD":"BUY", "JPY100":"SELL", ...}
+    과거 버전에서 BUY15/SELL30 같은 값이 들어있어도 정상화해서 처리합니다.
+    """
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -69,6 +73,22 @@ def load_state() -> Dict[str, str]:
 def save_state_map(state_map: Dict[str, str]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state_map, f, ensure_ascii=False)
+
+
+def _normalize_side(x: Optional[str]) -> Optional[str]:
+    """
+    BUY15/BUY30/BUY -> BUY
+    SELL15/SELL30/SELL -> SELL
+    그 외 -> None
+    """
+    if not x:
+        return None
+    s = str(x).upper().strip()
+    if s.startswith("BUY"):
+        return "BUY"
+    if s.startswith("SELL"):
+        return "SELL"
+    return None
 
 
 # ================= 추세 계산 =================
@@ -102,10 +122,7 @@ def _trend_window(data: List[float], window_n: int, half_days: float) -> Optiona
 
 
 def _sign_pct(p: Optional[float], eps: float = 0.01) -> int:
-    """
-    pct_per_day 기준으로 상승/하락/보합 판정.
-    eps=0.01%/day 이하를 보합으로 간주(노이즈 컷).
-    """
+    # %/day 기준 노이즈 컷(0.01%/day 이하)
     if p is None:
         return 0
     if p > eps:
@@ -117,14 +134,14 @@ def _sign_pct(p: Optional[float], eps: float = 0.01) -> int:
 
 def _interpretation_label_7_en(t15: Optional[Dict[str, float]], t30: Optional[Dict[str, float]]) -> str:
     """
-    English indicators (7):
-    1) Uptrend Sustained
-    2) Uptrend Slowing
-    3) Turning Down
-    4) Flat
-    5) Turning Up
-    6) Downtrend Sustained
-    7) Downtrend Slowing
+    7 indicators (EN):
+    - Uptrend Sustained
+    - Uptrend Slowing
+    - Turning Down
+    - Flat
+    - Turning Up
+    - Downtrend Sustained
+    - Downtrend Slowing
     """
     if t15 is None or t30 is None:
         return "Flat"
@@ -279,31 +296,29 @@ def bootstrap_fill_30d_if_needed(series_map: Dict[str, List[float]]) -> Dict[str
 
 # ================= 신호 판정 =================
 
-def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float) -> Tuple[str, Optional[str]]:
-    """
-    return: (state, sig) where sig is one of BUY30/BUY15/SELL30/SELL15 or None
-    """
+def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float) -> Optional[str]:
+    # 30D 우선
     if a30 is not None and price < a30 * th:
-        return "BUY30", "BUY30"
+        return "BUY30"
     if a15 is not None and price < a15 * th:
-        return "BUY15", "BUY15"
+        return "BUY15"
     if a30 is not None and price > a30 * th:
-        return "SELL30", "SELL30"
+        return "SELL30"
     if a15 is not None and price > a15 * th:
-        return "SELL15", "SELL15"
-    return "NONE", None
+        return "SELL15"
+    return None
 
 
-def _alert_side(sig: str) -> Tuple[str, str, str]:
-    """
-    sig: BUY30/BUY15/SELL30/SELL15
-    return: (emoji, side, basis)
-    """
-    if sig.startswith("BUY"):
-        return "🟢", "BUY", "30D" if sig.endswith("30") else "15D"
-    if sig.startswith("SELL"):
-        return "🔴", "SELL", "30D" if sig.endswith("30") else "15D"
-    return "⚪", "ALERT", "30D" if sig.endswith("30") else "15D"
+def _sig_to_side(sig: str) -> str:
+    return "BUY" if sig.startswith("BUY") else "SELL"
+
+
+def _sig_to_emoji(sig: str) -> Tuple[str, str, str]:
+    side = _sig_to_side(sig)
+    basis = "30D" if sig.endswith("30") else "15D"
+    if side == "BUY":
+        return "🟢", "BUY", basis
+    return "🔴", "SELL", basis
 
 
 # ================= 화살표 이미지 (10도 단위, 상하 18장) =================
@@ -362,9 +377,6 @@ def _get_arrow_image_path_10(angle_deg: float) -> Optional[str]:
 
 
 def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
-    """
-    통화 1개용 이미지: (30D, 15D)
-    """
     _ensure_dirs()
 
     p15 = _get_arrow_image_path_10(angle15)
@@ -384,7 +396,6 @@ def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> st
         font_small = ImageFont.load_default()
 
     d.text((16, 12), f"{code} Trend", fill=(255, 255, 255, 255), font=font)
-
     d.text((70, 60), "30D", fill=(255, 255, 255, 255), font=font_mid)
     d.text((265, 60), "15D", fill=(255, 255, 255, 255), font=font_mid)
 
@@ -412,12 +423,10 @@ def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> st
 def main():
     th = _get_threshold()
 
-    # 1) 통화별 CSV 로드
-    series_map: Dict[str, List[float]] = {}
-    for _, code in CURRENCIES:
-        series_map[code] = load_data(_csv_name(code))
+    # 1) CSV 로드
+    series_map: Dict[str, List[float]] = {code: load_data(_csv_name(code)) for _, code in CURRENCIES}
 
-    # 2) 부족하면 30일 부트스트랩
+    # 2) 부트스트랩
     if any(len(series_map[code]) < MAX_30D for _, code in CURRENCIES):
         try:
             series_map = bootstrap_fill_30d_if_needed(series_map)
@@ -433,16 +442,18 @@ def main():
         send_message(f"⚠️ FX fetch failed\n{e}")
         return
 
-    # 4) 긴급 체크(직전 대비) — 있으면 긴급만 보내고 종료
+    # 4) 긴급 체크
     urgent_lines: List[str] = []
     urgent_any = False
-    for cur_unit, code in CURRENCIES:
+    for _, code in CURRENCIES:
         r = latest_map.get(code)
         if not r or r.get("deal") is None:
             continue
+
         price = float(r["deal"])
         prev_series = series_map.get(code, [])
         prev_price = prev_series[-1] if prev_series else None
+
         if prev_price is not None and prev_price != 0:
             pct = (price - prev_price) / prev_price * 100.0
             if abs(pct) >= URGENT_PCT:
@@ -451,7 +462,7 @@ def main():
                 urgent_lines.append(f"- {code}: {prev_price:.4f} → {price:.4f} ({pct:+.3f}%, {direction})")
 
     # 5) 데이터 반영 + 저장
-    for cur_unit, code in CURRENCIES:
+    for _, code in CURRENCIES:
         r = latest_map.get(code)
         if not r or r.get("deal") is None:
             continue
@@ -470,10 +481,11 @@ def main():
         send_message(msg)
         return
 
-    # 6) 신호가 있는 통화만: 3줄 + 이미지(통화별 메시지로 따로 발송)
+    # 6) 방향 전환 시에만 발송 (state.json을 BUY/SELL로 정규화해서 비교)
     state_map = load_state()
+    state_changed = False
 
-    for cur_unit, code in CURRENCIES:
+    for _, code in CURRENCIES:
         r = latest_map.get(code)
         if not r or r.get("deal") is None:
             continue
@@ -483,15 +495,24 @@ def main():
             continue
 
         price = float(r["deal"])
-
         a15 = avg_last(series, MAX_15D)
         a30 = avg_last(series, MAX_30D)
 
-        state, sig = decide_signal(price, a15, a30, th)
+        sig = decide_signal(price, a15, a30, th)
         if sig is None:
-            continue  # 실전: 신호 있을 때만
+            continue  # 신호 없으면 발송 없음
 
-        # 추세(보조 지표)
+        curr_side = _normalize_side(_sig_to_side(sig))       # "BUY"/"SELL"
+        prev_side = _normalize_side(state_map.get(code))     # 과거값(BUY15 등)도 정상화
+
+        if curr_side is None:
+            continue
+
+        # ✅ 같은 방향 연속이면 스킵
+        if prev_side == curr_side:
+            continue
+
+        # 보조 지표(표시용)
         t15 = _trend_window(series, MAX_15D, half_days=7.5)
         t30 = _trend_window(series, MAX_30D, half_days=15.0)
 
@@ -499,30 +520,27 @@ def main():
         p30 = t30["pct_per_day"] if t30 else None
         p15 = t15["pct_per_day"] if t15 else None
 
-        emoji, side, basis = _alert_side(sig)
+        emoji, side, basis = _sig_to_emoji(sig)
 
-        # ✅ 3줄 고정 포맷
-        # 1) 현재가 + 매수/매도 알림(핵심) + 해석지표(영어)
-        # 2) 30day 보조 지표
-        # 3) 15day 보조 지표
+        # ✅ 3줄 고정
         line1 = f"{code}: {price:.4f} | {emoji} {side} ALERT ({basis}) | {indicator}"
         line2 = f"30day: {_fmt_pct(p30)}"
         line3 = f"15day: {_fmt_pct(p15)}"
         text = "\n".join([line1, line2, line3])
 
-        # 이미지(통화별 1장)
+        # 이미지(통화별)
         angle15 = float(t15["angle_deg"]) if t15 else 0.0
         angle30 = float(t30["angle_deg"]) if t30 else 0.0
         img_path = _build_currency_trend_panel(code, angle15=angle15, angle30=angle30)
 
-        # state 저장(통화별)
-        prev_state = state_map.get(code, "NONE")
-        if state != prev_state:
-            state_map[code] = state
-
         send_message(text, file_path=img_path, filename=f"trend_{code}.png")
 
-    save_state_map(state_map)
+        # ✅ 발송했으면 마지막 방향만 저장(BUY/SELL)
+        state_map[code] = curr_side
+        state_changed = True
+
+    if state_changed:
+        save_state_map(state_map)
 
 
 if __name__ == "__main__":
