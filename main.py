@@ -23,7 +23,7 @@ STATE_FILE = "state.json"
 NEWS_STATE_FILE = "sent_news.json"
 ASSET_DIR = "assets"
 
-URGENT_PCT = 0.5
+URGENT_PCT = 0.5  # 0.5% 이상 변동 시 긴급
 CURRENCY_TICKERS = [("JPY100", "JPYKRW=X"), ("USD", "USDKRW=X"), ("AUD", "AUDKRW=X"), ("CHF", "CHFKRW=X")]
 
 # ================= 유틸리티 =================
@@ -48,8 +48,8 @@ def save_state(data, path):
 def _normalize_side(x: Optional[str]) -> Optional[str]:
     if not x: return None
     s = str(x).upper().strip()
-    if s.startswith("BUY"): return "BUY"
-    if s.startswith("SELL"): return "SELL"
+    if "BUY" in s: return "BUY"
+    if "SELL" in s: return "SELL"
     return None
 
 # ================= 뉴스 기능 =================
@@ -75,7 +75,7 @@ def fetch_currency_news() -> List[str]:
                 news_to_send.append(f"📰 **{title}**\n{link}")
                 sent_news[link] = datetime.now().isoformat()
         if len(sent_news) > 50:
-            for k in list(sent_news.keys())[:-50]: del sent_news[k]
+            sent_news = dict(list(sent_news.items())[-50:])
         save_state(sent_news, NEWS_STATE_FILE)
     except Exception as e: print(f"DEBUG: News Error -> {e}")
     return news_to_send
@@ -98,7 +98,7 @@ def _build_currency_trend_panel(code, a15, a30):
     d = ImageDraw.Draw(panel)
     try: f = ImageFont.load_default()
     except: f = None
-    d.text((16, 12), f"{code} Trend", fill=(255, 255, 255), font=f)
+    d.text((16, 12), f"{code} ExpertAlpha Trend", fill=(255, 255, 255), font=f)
     d.text((70, 60), f"30D ({a30:+.1f}°)", fill=(255, 255, 255), font=f)
     d.text((265, 60), f"15D ({a15:+.1f}°)", fill=(255, 255, 255), font=f)
     path = os.path.join(ASSET_DIR, f"trend_{code}.png")
@@ -132,49 +132,59 @@ def main():
     # 3. 데이터 업데이트 및 알림 판정
     state_map = load_state(STATE_FILE)
     state_changed = False
-    manual_lines = []
+    status_lines = []
 
     for code, _ in CURRENCY_TICKERS:
         price = latest_map.get(code)
         if price is None: continue
         
-        # 💡 CSV에서 기존 데이터를 리스트로 제대로 불러옴
         series = load_data(_csv_name(code))
         
-        if not series or series[-1] != price:
-            if series:
-                pct = (price - series[-1]) / series[-1] * 100.0
-                if abs(pct) >= URGENT_PCT:
-                    # 긴급 알림 (임시 시뮬레이션 데이터로 추세 계산)
-                    tmp = append_and_trim(series, price, MAX_30D)
-                    t15 = _trend_window(tmp, MAX_15D, 7.5); t30 = _trend_window(tmp, MAX_30D, 15.0)
-                    u_img = _build_currency_trend_panel(code, t15["angle_deg"] if t15 else 0.0, t30["angle_deg"] if t30 else 0.0)
-                    send_message(f"🚨 **[URGENT] {code}**\n{series[-1]:.2f} → **{price:.2f}** ({pct:+.3f}%)", file_path=u_img)
-
-            # 💡 [핵심] 기존 데이터에 새 값을 붙여서 다시 저장 (누적)
-            series = append_and_trim(series, price, MAX_30D)
-            save_data(series, _csv_name(code))
-            state_changed = True
-
-        # 시그널 판정
+        # 방향 및 화살표 판단
+        prev_price = series[-1] if series else price
+        diff = price - prev_price
+        arrow = "🔺" if diff > 0 else "🔻" if diff < 0 else "➖"
+        
+        # 평균값 계산
         a15, a30 = avg_last(series, MAX_15D), avg_last(series, MAX_30D)
-        t15 = _trend_window(series, MAX_15D, 7.5); t30 = _trend_window(series, MAX_30D, 15.0)
+        if not a30: a30 = price
         
-        sig = None
-        if a30 and price < a30 * (2 - th): sig = "BUY30"
-        elif a30 and price > a30 * th: sig = "SELL30"
+        # BUY/SELL 및 긴급도 로직
+        pct_from_avg = (price - a30) / a30 * 100.0
+        is_urgent = abs(pct_from_avg) >= URGENT_PCT
         
-        curr_side = _normalize_side(sig) if sig else "NONE"
+        sig = "BUY" if price < a30 else "SELL"
+        curr_side = sig
         prev_side = _normalize_side(state_map.get(code))
         
-        if sig and curr_side != prev_side:
+        # 알림 발송 조건: 상태 변화가 있거나, 긴급하거나, 수동 실행일 때
+        if curr_side != prev_side or is_urgent or is_manual:
+            t15 = _trend_window(series, MAX_15D, 7.5); t30 = _trend_window(series, MAX_30D, 15.0)
             img = _build_currency_trend_panel(code, t15["angle_deg"] if t15 else 0.0, t30["angle_deg"] if t30 else 0.0)
-            send_message(f"**{code}: {price:.2f}** | {'🟢' if 'BUY' in sig else '🔴'} {sig}", file_path=img)
-            state_map[code] = curr_side; state_changed = True
+            
+            status_tag = "⚠️ [URGENT]" if is_urgent else "📢 [REPORT]"
+            action_tag = "🟢 BUY" if sig == "BUY" else "🔴 SELL"
+            
+            msg = (
+                f"{status_tag} **{code} 보고**\n"
+                f"현재가: **{price:.2f}** {arrow} ({diff:+.2f})\n"
+                f"평균가 대비: {pct_from_avg:+.2f}% -> **{action_tag}**\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📊 추세: 15D({t15['angle_deg'] if t15 else 0:+.1f}°) | 30D({t30['angle_deg'] if t30 else 0:+.1f}°)"
+            )
+            send_message(msg, file_path=img)
+            state_map[code] = curr_side
+            state_changed = True
 
-        if is_manual: manual_lines.append(f"**{code}**: {price:.2f}")
+        # 데이터 저장
+        series = append_and_trim(series, price, MAX_30D)
+        save_data(series, _csv_name(code))
+        state_changed = True
+        status_lines.append(f"**{code}**: {price:.2f} ({arrow})")
 
-    if is_manual: send_message(f"🔍 **Status**\n" + "\n".join(manual_lines))
+    if is_manual:
+        send_message(f"🔍 **ExpertAlpha 실시간 상태**\n" + "\n".join(status_lines))
+    
     if state_changed: save_state(state_map, STATE_FILE)
     print(f"환율 체크 완료: {used_date}")
 
