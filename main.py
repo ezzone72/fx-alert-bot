@@ -66,7 +66,7 @@ def _normalize_side(x: Optional[str]) -> Optional[str]:
 # ================= 뉴스 기능 =================
 
 def fetch_currency_news() -> List[str]:
-    keywords = ["달러", "엔화", "원화", "스위스", "호주달러"]
+    keywords = ["달러", "엔화", "원화", "스위스", "호주달러","환율"]
     sent_news = load_state(NEWS_STATE_FILE)
     
     # 네이버 뉴스 최신순 검색 (쿼리: 환율)
