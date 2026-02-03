@@ -147,4 +147,85 @@ def _ensure_dirs():
 def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
     _ensure_dirs()
     W, H = 420, 220
-    panel = Image.new("RGBA",
+    panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
+    d = ImageDraw.Draw(panel)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        font_mid = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except:
+        font = font_mid = ImageFont.load_default()
+    
+    d.text((16, 12), f"{code} Trend", fill=(255, 255, 255), font=font)
+    d.text((70, 60), f"30D ({angle30:+.1f}°)", fill=(255, 255, 255), font=font_mid)
+    d.text((265, 60), f"15D ({angle15:+.1f}°)", fill=(255, 255, 255), font=font_mid)
+    
+    path = os.path.join(ASSET_DIR, f"trend_{code}.png")
+    panel.save(path, "PNG")
+    return path
+
+# ================= 메인 =================
+
+def main():
+    th = _get_threshold()
+    is_manual = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    
+    series_map = {code: load_data(_csv_name(code)) for _, code in CURRENCY_TICKERS}
+    try:
+        latest_map, used_date = fetch_latest_rates_yahoo()
+    except Exception as e:
+        send_message(f"⚠️ Yahoo FX fetch failed: {e}")
+        return
+
+    urgent_lines, manual_report_lines = [], []
+    state_changed = False
+    state_map = load_state()
+
+    for code, _ in CURRENCY_TICKERS:
+        r = latest_map.get(code)
+        if not r: continue
+        price = r["deal"]
+        prev_series = series_map.get(code, [])
+        
+        if not prev_series or prev_series[-1] != price:
+            if prev_series and prev_series[-1] != 0:
+                pct = (price - prev_series[-1]) / prev_series[-1] * 100.0
+                if abs(pct) >= URGENT_PCT:
+                    urgent_lines.append(f"- {code}: {prev_series[-1]:.2f} → {price:.2f} ({pct:+.3f}%)")
+            series_map[code] = append_and_trim(prev_series, price, MAX_30D)
+            save_data(series_map[code], _csv_name(code))
+            state_changed = True
+
+        series = series_map[code]
+        a15, a30 = avg_last(series, MAX_15D), avg_last(series, MAX_30D)
+        sig = decide_signal(price, a15, a30, th)
+        t15, t30 = _trend_window(series, MAX_15D, 7.5), _trend_window(series, MAX_30D, 15.0)
+        
+        curr_side = _normalize_side(sig) if sig else "NONE"
+        prev_side = _normalize_side(state_map.get(code))
+        
+        emoji, side, basis = _sig_to_emoji(sig) if sig else ("ℹ️", "KEEP", "N/A")
+        indicator = _interpretation_label_7_en(t15, t30)
+        
+        status_text = (f"**{code}: {price:.2f}** | {emoji} {side} ({basis})\n"
+                       f"└ {indicator} | 30d: {_fmt_pct(t30['pct_per_day'] if t30 else None)}")
+
+        if sig and curr_side != prev_side:
+            img_path = _build_currency_trend_panel(code, t15["angle_deg"] if t15 else 0.0, t30["angle_deg"] if t30 else 0.0)
+            send_message(status_text, file_path=img_path, filename=f"trend_{code}.png")
+            state_map[code] = curr_side
+            state_changed = True
+
+        if is_manual: 
+            manual_report_lines.append(status_text)
+
+    if urgent_lines:
+        send_message(f"🚨 **URGENT MOVE** ({used_date})\n" + "\n".join(urgent_lines))
+    
+    if is_manual:
+        send_message(f"🔍 **Manual Status Report** ({used_date})\n\n" + "\n".join(manual_report_lines))
+
+    if state_changed: 
+        save_state_map(state_map)
+
+if __name__ == "__main__":
+    main()
