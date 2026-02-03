@@ -2,3 +2,4 @@ requests
 python-dotenv
 Pillow
 yfinance
+beautifulsoup4
