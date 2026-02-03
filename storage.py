@@ -3,9 +3,9 @@ from typing import List, Optional
 
 DEFAULT_FILE = "data.csv"
 
-# 30분봉 기준
-MAX_15D = 2 * 24 * 15   # 720
-MAX_30D = 2 * 24 * 30   # 1440
+# 30분봉 기준 10분기준으로 변경
+MAX_15D = 6 * 24 * 15   # 720
+MAX_30D = 6 * 24 * 30   # 1440
 
 
 def load_data(filename: str = DEFAULT_FILE) -> List[float]:
