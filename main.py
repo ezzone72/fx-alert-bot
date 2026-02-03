@@ -111,4 +111,74 @@ def fetch_latest_rates_yahoo() -> Tuple[Dict[str, Dict[str, float]], str]:
         try:
             yt = yf.Ticker(ticker)
             df = yt.history(period="1d", interval="1m")
-            if df.empty: df = yt.history(period="5d",
+            if df.empty:
+                df = yt.history(period="5d", interval="1m")
+            if not df.empty:
+                current_price = float(df['Close'].iloc[-1])
+                if code == "JPY100": current_price *= 100
+                out[code] = {"deal": current_price}
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}")
+    if not out: raise RuntimeError("Yahoo Finance 데이터 수집 실패")
+    return out, now_kst.strftime("%Y-%m-%d %H:%M")
+
+# ================= 신호 및 시각화 =================
+
+def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float) -> Optional[str]:
+    if a30 is not None and price < a30 * (2 - th): return "BUY30"
+    if a15 is not None and price < a15 * (2 - th): return "BUY15"
+    if a30 is not None and price > a30 * th: return "SELL30"
+    if a15 is not None and price > a15 * th: return "SELL15"
+    return None
+
+def _sig_to_emoji(sig: str) -> Tuple[str, str, str]:
+    side = "BUY" if sig.startswith("BUY") else "SELL"
+    basis = "30D" if sig.endswith("30") else "15D"
+    return ("🟢", "BUY", basis) if side == "BUY" else ("🔴", "SELL", basis)
+
+def _ensure_dirs():
+    for d in [ARROW_DIR, ASSET_DIR]: os.makedirs(d, exist_ok=True)
+
+def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
+    _ensure_dirs()
+    W, H = 420, 220
+    panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
+    d = ImageDraw.Draw(panel)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        font_mid = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except:
+        font = font_mid = ImageFont.load_default()
+    
+    d.text((16, 12), f"{code} Trend", fill=(255, 255, 255), font=font)
+    d.text((70, 60), f"30D ({angle30:+.1f}°)", fill=(255, 255, 255), font=font_mid)
+    d.text((265, 60), f"15D ({angle15:+.1f}°)", fill=(255, 255, 255), font=font_mid)
+    
+    path = os.path.join(ASSET_DIR, f"trend_{code}.png")
+    panel.save(path, "PNG")
+    return path
+
+# ================= 메인 =================
+
+def main():
+    th = _get_threshold()
+    is_manual = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    
+    series_map = {code: load_data(_csv_name(code)) for _, code in CURRENCY_TICKERS}
+    try:
+        latest_map, used_date = fetch_latest_rates_yahoo()
+    except Exception as e:
+        send_message(f"⚠️ Yahoo FX fetch failed: {e}")
+        return
+
+    state_changed = False
+    state_map = load_state()
+    manual_report_lines = []
+
+    for code, _ in CURRENCY_TICKERS:
+        r = latest_map.get(code)
+        if not r: continue
+        price = r["deal"]
+        prev_series = series_map.get(code, [])
+        
+        # 1. 데이터 업데이트 및 긴급(Urgent) 체크
