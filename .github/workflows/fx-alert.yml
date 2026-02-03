@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # every 30 minutes
-    - cron: "*/30 * * * *"
+    - cron: "*/10 * * * *"
 
 # ✅ push(커밋/푸시) 하려면 반드시 필요
 permissions:
