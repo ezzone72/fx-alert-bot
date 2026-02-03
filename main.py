@@ -93,7 +93,67 @@ def _interpretation_label_7_en(t15: Optional[Dict[str, float]], t30: Optional[Di
     def _sign(p, eps=0.01):
         if p is None or abs(p) <= eps: return 0
         return 1 if p > 0 else -1
+    
     s15, s30 = _sign(t15.get("pct_per_day")), _sign(t30.get("pct_per_day"))
+    
     if s15 == 0 and s30 == 0: return "Flat"
     if s30 > 0 and s15 < 0: return "Turning Down"
-    if s30 < 0 and s15 > 0
+    if s30 < 0 and s15 > 0: return "Turning Up"  # <-- 여기서 콜론이 빠졌었습니다!
+    
+    if s30 > 0 and s15 > 0: 
+        return "Uptrend Sustained" if t15["pct_per_day"] >= t30["pct_per_day"] else "Uptrend Slowing"
+    if s30 < 0 and s15 < 0: 
+        return "Downtrend Sustained" if abs(t15["pct_per_day"]) >= abs(t30["pct_per_day"]) else "Downtrend Slowing"
+    
+    return "Flat"
+
+# ================= 데이터 수집 (Yahoo Finance) =================
+
+def fetch_latest_rates_yahoo() -> Tuple[Dict[str, Dict[str, float]], str]:
+    kst = ZoneInfo("Asia/Seoul")
+    now_kst = datetime.now(kst)
+    out: Dict[str, Dict[str, float]] = {}
+    for code, ticker in CURRENCY_TICKERS:
+        try:
+            yt = yf.Ticker(ticker)
+            df = yt.history(period="1d", interval="1m")
+            if df.empty: df = yt.history(period="5d", interval="1m")
+            if not df.empty:
+                current_price = float(df['Close'].iloc[-1])
+                if code == "JPY100": current_price *= 100
+                out[code] = {"deal": current_price}
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}")
+    if not out: raise RuntimeError("Yahoo Finance 데이터 수집 실패")
+    return out, now_kst.strftime("%Y-%m-%d %H:%M")
+
+# ================= 신호 및 시각화 =================
+
+def decide_signal(price: float, a15: Optional[float], a30: Optional[float], th: float) -> Optional[str]:
+    if a30 is not None and price < a30 * (2 - th): return "BUY30"
+    if a15 is not None and price < a15 * (2 - th): return "BUY15"
+    if a30 is not None and price > a30 * th: return "SELL30"
+    if a15 is not None and price > a15 * th: return "SELL15"
+    return None
+
+def _sig_to_emoji(sig: str) -> Tuple[str, str, str]:
+    side = "BUY" if sig.startswith("BUY") else "SELL"
+    basis = "30D" if sig.endswith("30") else "15D"
+    return ("🟢", "BUY", basis) if side == "BUY" else ("🔴", "SELL", basis)
+
+def _ensure_dirs():
+    for d in [ARROW_DIR, ASSET_DIR]: os.makedirs(d, exist_ok=True)
+
+def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
+    _ensure_dirs()
+    W, H = 420, 220
+    panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
+    d = ImageDraw.Draw(panel)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        font_mid = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except:
+        font = font_mid = ImageFont.load_default()
+    d.text((16, 12), f"{code} Trend", fill=(255, 255, 255), font=font)
+    d.text((70, 60), f"30D ({angle30:+.1f}°)", fill=(255, 255, 255), font=font_mid)
+    d.text((265, 60), f"15D ({angle15:+.1f}°)", fill=(25
