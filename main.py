@@ -98,7 +98,7 @@ def _interpretation_label_7_en(t15: Optional[Dict[str, float]], t30: Optional[Di
     
     if s15 == 0 and s30 == 0: return "Flat"
     if s30 > 0 and s15 < 0: return "Turning Down"
-    if s30 < 0 and s15 > 0: return "Turning Up"  # <-- 여기서 콜론이 빠졌었습니다!
+    if s30 < 0 and s15 > 0: return "Turning Up"
     
     if s30 > 0 and s15 > 0: 
         return "Uptrend Sustained" if t15["pct_per_day"] >= t30["pct_per_day"] else "Uptrend Slowing"
@@ -147,13 +147,4 @@ def _ensure_dirs():
 def _build_currency_trend_panel(code: str, angle15: float, angle30: float) -> str:
     _ensure_dirs()
     W, H = 420, 220
-    panel = Image.new("RGBA", (W, H), (20, 20, 20, 255))
-    d = ImageDraw.Draw(panel)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 22)
-        font_mid = ImageFont.truetype("DejaVuSans.ttf", 18)
-    except:
-        font = font_mid = ImageFont.load_default()
-    d.text((16, 12), f"{code} Trend", fill=(255, 255, 255), font=font)
-    d.text((70, 60), f"30D ({angle30:+.1f}°)", fill=(255, 255, 255), font=font_mid)
-    d.text((265, 60), f"15D ({angle15:+.1f}°)", fill=(25
+    panel = Image.new("RGBA",
